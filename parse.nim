@@ -167,17 +167,13 @@ proc dump(self: Block, path: string) =
   header.colLen = self.columns.len
   var strm = newFileStream(path, fmWrite)
 
-  var off: int = 0
-  var offsets = newSeqOfCap[int](self.val2id.len)
   for val in self.val2id.keys():
     strm.write(val)
-    offsets.add(off)
-    off += val.len
   header.valuesOff = strm.getPosition()
-  var delta = deltaEncode(offsets)
-  var rle = RLE(delta)
-  for off in rle:
+  var off: int = 0
+  for val in self.val2id.keys():
     strm.write(off)
+    off += val.len
   var valuesSize = strm.getPosition() 
   var columnsSize = strm.getPosition()
   for col in self.columns.mitems:
@@ -223,8 +219,8 @@ proc dump(self: Block, path: string) =
     entry.offset = strm.getPosition()
     strm.writeData(entry.fields[0].addr, sizeof(Field)*entry.fields.len)
   header.entriesOff = strm.getPosition()
-  delta = deltaEncode(self.entries.map(x => x.offset))
-  rle = RLE(delta)
+  var delta = deltaEncode(self.entries.map(x => x.offset))
+  var rle = RLE(delta)
   for off in rle:
     strm.write(off)
   entriesSize = strm.getPosition() - entriesSize
