@@ -11,32 +11,9 @@ import std/strutils
 import std/hashes
 import pkg/cbor
 
-template bench(name: string, b: untyped) =
-  echo name, ':', " (x1000)"
-  var start = getMonoTime()
-  for i in 1..1_000:
-    b
-  let dur = getMonoTime() - start
-  echo dur
-  echo math.floor(1_000_000_000 / (dur.inNanoseconds/1000)), ' ', "rps"
-
-template smallbench(name: string, b: untyped) =
-  echo name, ':', " (x1)"
-  var start = getMonoTime()
-  b
-  echo getMonoTime() - start
-
-proc hs(bytes: int, dp=1): string =
-  const thresh = 1024
-  if bytes < thresh:
-    return $(bytes) & " B"
-  var b = float(bytes)
-  const units = @["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"]
-  var u = -1
-  while b > thresh and u < units.high:
-    b /= thresh
-    u += 1
-  return $math.round(b, dp) & ' ' & units[u]
+import ./btree
+import ./bloom
+import ./utils
 
 proc toCbor*(js: JsonNode): CborNode {.gcsafe.} =
   # RFC8949 - 6.2.  Converting from JSON to CBOR
@@ -86,53 +63,11 @@ proc deltaEncode[T](arr: openArray[T]): seq[T] =
   for i in 1..arr.high:
     result[i] = arr[i]-arr[i-1]
 
-type BloomFilter = object
-  data: seq[int64]
-  len: int
-  n: int
-  p: float64
-  k: int
-
-proc initBloomFilter(n: int, p: float): BloomFilter =
-  const ln2 = ln(2.float32)
-  const ln2sqr = ln2*ln2
-  let bits = int(-(n.float64*math.ln(p))/ln2sqr)
-  result.data = newSeq[int64](bits div 64)
-  result.k = int((bits/n)*ln2)
-  result.n = n
-  result.p = p
-
-proc incl(bf: var BloomFilter, v: int) =
-  var q = v.uint64
-  var existed = true
-  for i in 1..bf.k:
-    q = hash(q).uint64
-    let bit = q mod (bf.data.len*64).uint64
-    let index = bit div 64
-    if (bf.data[index] and (1 shl (bit mod 64))) == 0:
-        existed = false
-    bf.data[index] = bf.data[index] or (1 shl (bit mod 64))
-  if not existed:
-    bf.len += 1
-
-proc contains(bf: var BloomFilter, v: int): bool =
-  var q = v.uint64
-  for i in 1..bf.k:
-    q = hash(q).uint64
-    let bit = q mod (bf.data.len*64).uint64
-    let index = bit div 64
-    if (bf.data[index] and (1 shl (bit mod 64))) == 0:
-      return false
-  return true
-
 type
   Id = uint32
-  DataEntry = object
-    valId: Id
-    logId: Id
   Column = ref object
     id: Id
-    data: seq[DataEntry] # change to Heap
+    val2log: Btree[string, seq[Id]]
     log2val: Table[Id, Id]
     offset: int
     logsBloom: BloomFilter
@@ -146,13 +81,15 @@ type
     colId: Id
     valId: Id
     columns: Table[Id, Column]
-    val2Id: OrderedTable[string, Id]
+    val2Id: Table[string, Id]
+    id2Val: seq[string]
     # entries: seq[Entry]
 
 proc initBlock(): Block =
   new result
   result.columns = initTable[Id, Column]()
-  result.val2Id = initOrderedTable[string, Id]()
+  result.val2Id = initTable[string, Id]()
+  result.id2Val = newSeq[string]()
   # result.entries = newSeq[Entry]()
 
 type
@@ -172,8 +109,6 @@ proc flatEntry(e: JsonNode): FlatEntry =
   result = newSeqOfCap[FlatField](e.len)
   flatEntry(result, e, "")
 
-template h(x):untyped = (when defined(lessRan): hashRoMu1(x) else: hashNASAM(x))
-
 proc add(self: Block, entry: JsonNode) =
   assert entry.kind == JObject, "only JObject can be passed"
   let fe = flatEntry(entry)
@@ -186,11 +121,12 @@ proc add(self: Block, entry: JsonNode) =
     let field_name = cbor.encode(field.name)
     if not self.val2Id.hasKey(field_name):
       self.val2Id[field_name] = self.valId
+      self.id2Val.add(field_name)
       self.columns[self.valId] = Column(
         id: self.valId,
-        data: newSeq[DataEntry](),
         # logsBloom: initBloomFilter(100, 0.001)
-        log2Val: initTable[Id, Id]()
+        log2Val: initTable[Id, Id](),
+        val2Log: initBTree[string, seq[Id]]()
       )
       self.valId += 1
     let colId = self.val2Id[field_name]
@@ -198,10 +134,19 @@ proc add(self: Block, entry: JsonNode) =
     let val = cbor.encode(field.val.toCbor)
     if not self.val2Id.hasKey(val):
       self.val2Id[val] = self.valId
+      self.id2Val.add(val)
       self.valId += 1
     let valId = self.val2Id[val]
-    column.data.add(DataEntry(logId: logId, valId: valId))
     column.log2val[logId] = valId
+    if not column.val2log.contains(val):
+      var x = newSeq[Id](1)
+      x[0] = logId
+      column.val2log.add(val, x)
+    # if not column.val2log.contains(valId):
+    #   column.val2log.add(valId, @[logId])
+    # else:
+    #   var x = column.val2log.getOrDefault(valId)
+    #   x.add(logId)
 
     # column.logsBloom.incl(logId.int)
     # if column.logsBloom.len == column.logsBloom.n:
@@ -264,14 +209,11 @@ proc dump(self: Block, path: string) =
   #   col.logsBloom = initBloomFilter(col.data.len, 1/col.data.len)
   #   for t in col.data:
   #     col.logsBloom.incl(t.logId.int)
-
-  var values = toSeq(self.val2id.values)
-
-  for val in self.val2id.keys():
+  for val in self.id2Val:
     strm.write(val)
   header.valuesOff = strm.getPosition()
   var off: int = 0
-  for val in self.val2id.keys():
+  for val in self.id2val:
     strm.write(off)
     off += val.len
   var valuesSize = strm.getPosition() 
@@ -280,24 +222,23 @@ proc dump(self: Block, path: string) =
     var colHeader: ColumnHeader
     col.offset = strm.getPosition()
     colHeader.id = col.id.int
-    var data = col.data
-    sort(data, proc (x, y: DataEntry): int =
-      cmp(values[x.valId], values[y.valId]))
 
     # strm.writeData(col.logsBloom.data[0].addr, col.logsBloom.data.len)
     # strm.writeData(col.logsBloom.n.addr, 32)
 
-    var packed = pack(data.map(t=>t.valId), strm)
+    var data = newSeq[(Id, Id)]()
+    for x in col.val2log.pairs():
+      for y in x[1]:
+        data.add((self.val2id[x[0]], y))
+
+    var packed = pack(data.map(t=>t[0]), strm)
     colHeader.valEncoding = packed.encoding
     colHeader.valLen = packed.length
 
-    packed = pack(data.map(t=>t.logId), strm)
+    packed = pack(data.map(t=>t[1]), strm)
     colHeader.logEncoding = packed.encoding
     colHeader.logLen = packed.length
     strm.write(colHeader)
-
-    discard pack(col.data.map(t=>t.valId), strm)
-    discard pack(col.data.map(t=>t.logId), strm)
 
   header.columnsOff = strm.getPosition()
   for col in self.columns.values():
@@ -356,6 +297,7 @@ proc runBench() =
     j["time"].num = i
     j["name"].str = rndStr()
     b.add(j)
+  
   smallbench "b.dump":
     b.dump("out4.bin")
   
@@ -385,5 +327,15 @@ proc k8bench() =
   smallbench "dump k8logs":
     b.dump("out4.bin")
 
-runBench()
+# runBench()
 # k8bench()
+
+let b = initBlock()
+var j = %*{"time": getTime().toUnix(), "value": 1, "name": "super_duper_metric"}
+var i = 0
+bench "b.add":
+  i += 1
+  j["value"].num = i
+  j["time"].num = i
+  j["name"].str = rndStr()
+  b.add(j)
