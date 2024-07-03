@@ -131,7 +131,6 @@ type
     valId: Id
     logId: Id
   Column = ref object
-    name: Id
     id: Id
     data: seq[DataEntry] # change to Heap
     log2val: Table[Id, Id]
@@ -146,15 +145,13 @@ type
     logId: Id
     colId: Id
     valId: Id
-    columns: seq[Column]
-    columnName2Id: OrderedTable[string, Id]
+    columns: Table[Id, Column]
     val2Id: OrderedTable[string, Id]
     # entries: seq[Entry]
 
 proc initBlock(): Block =
   new result
-  result.columns = newSeq[Column]()
-  result.columnName2Id = initOrderedTable[string, Id]()
+  result.columns = initTable[Id, Column]()
   result.val2Id = initOrderedTable[string, Id]()
   # result.entries = newSeq[Entry]()
 
@@ -186,23 +183,17 @@ proc add(self: Block, entry: JsonNode) =
   let logId = self.logId
   self.logId += 1
   for field in fe:
-    # XXX: reuse val2Id (name -> val)
-    if not self.columnName2Id.hasKey(field.name):
-      self.columnName2Id[field.name] = self.colId
-      # XXX: move to own function
-      # XXX: replace val2Id with btree
-      if not self.val2Id.hasKey(field.name):
-        self.val2Id[field.name] = self.valId
-        self.valId += 1
-      self.columns.add(Column(
-        id: self.colId,
-        name: self.val2Id[field.name],
+    let field_name = cbor.encode(field.name)
+    if not self.val2Id.hasKey(field_name):
+      self.val2Id[field_name] = self.valId
+      self.columns[self.valId] = Column(
+        id: self.valId,
         data: newSeq[DataEntry](),
         # logsBloom: initBloomFilter(100, 0.001)
         log2Val: initTable[Id, Id]()
-      ))
-      self.colId += 1
-    let colId = self.columnName2Id[field.name]
+      )
+      self.valId += 1
+    let colId = self.val2Id[field_name]
     var column = self.columns[colId]
     let val = cbor.encode(field.val.toCbor)
     if not self.val2Id.hasKey(val):
@@ -235,7 +226,7 @@ type
     No
     DeltaRle
   ColumnHeader = object
-    name: int
+    id: int
     valLen: int
     logLen: int
     valEncoding: Encoding
@@ -259,7 +250,7 @@ proc pack(data: openarray[Id], stream: Stream): tuple[length: int, encoding: Enc
 
 proc getLog(self: Block, id: Id): Entry = 
   result.fields = newSeq[Field]()
-  for col in self.columns:
+  for col in self.columns.values():
     if col.log2val.hasKey(id):
       result.fields.add(Field(colId: col.id, valId: col.log2val[id]))
 
@@ -269,10 +260,10 @@ proc dump(self: Block, path: string) =
   header.colLen = self.columns.len
   var strm = newFileStream(path, fmWrite)
 
-  for col in self.columns.mitems:
-    col.logsBloom = initBloomFilter(col.data.len, 1/col.data.len)
-    for t in col.data:
-      col.logsBloom.incl(t.logId.int)
+  # for col in self.columns.mitems:
+  #   col.logsBloom = initBloomFilter(col.data.len, 1/col.data.len)
+  #   for t in col.data:
+  #     col.logsBloom.incl(t.logId.int)
 
   var values = toSeq(self.val2id.values)
 
@@ -285,16 +276,16 @@ proc dump(self: Block, path: string) =
     off += val.len
   var valuesSize = strm.getPosition() 
   var columnsSize = strm.getPosition()
-  for col in self.columns.mitems:
+  for col in self.columns.values():
     var colHeader: ColumnHeader
     col.offset = strm.getPosition()
-    colHeader.name = col.name.int
+    colHeader.id = col.id.int
     var data = col.data
     sort(data, proc (x, y: DataEntry): int =
       cmp(values[x.valId], values[y.valId]))
 
-    strm.writeData(col.logsBloom.data[0].addr, col.logsBloom.data.len)
-    strm.writeData(col.logsBloom.n.addr, 32)
+    # strm.writeData(col.logsBloom.data[0].addr, col.logsBloom.data.len)
+    # strm.writeData(col.logsBloom.n.addr, 32)
 
     var packed = pack(data.map(t=>t.valId), strm)
     colHeader.valEncoding = packed.encoding
@@ -309,7 +300,7 @@ proc dump(self: Block, path: string) =
     discard pack(col.data.map(t=>t.logId), strm)
 
   header.columnsOff = strm.getPosition()
-  for col in self.columns:
+  for col in self.columns.values():
     strm.write(col.offset)
   columnsSize = strm.getPosition() - columnsSize
   
@@ -367,6 +358,14 @@ proc runBench() =
     b.add(j)
   smallbench "b.dump":
     b.dump("out4.bin")
+  
+  var log = newJObject()
+  for i in 0..1000:
+    log["a" & $i] = JsonNode(kind: JInt, num: i)
+  b.add(log)
+
+  bench "block.getLog":
+    discard b.getLog(2)
 
 proc k8bench() =
   let json = readFile("k8slog_json.json")
@@ -386,5 +385,5 @@ proc k8bench() =
   smallbench "dump k8logs":
     b.dump("out4.bin")
 
-# runBench()
-k8bench()
+runBench()
+# k8bench()
