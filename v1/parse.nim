@@ -15,53 +15,6 @@ import ./btree
 import ./bloom
 import ./utils
 
-proc toCbor*(js: JsonNode): CborNode {.gcsafe.} =
-  # RFC8949 - 6.2.  Converting from JSON to CBOR
-  case js.kind
-  of JString:
-    result = js.str.toCbor
-  of JInt:
-    result = js.num.toCbor
-  of JFloat:
-    result = js.fnum.toCbor
-  of JBool:
-    result = js.bval.toCbor
-  of JNull:
-    result = CborNode(kind: cborSimple, simple: 22)
-  of JObject:
-    result = CborNode(kind: cborMap)
-    for k, v in js.fields.pairs:
-      result[k.toCbor] = v.toCbor
-    sort(result)
-  of JArray:
-    result = CborNode(kind: cborArray, seq: newSeq[CborNode](js.elems.len))
-    for i, e in js.elems:
-      result.seq[i] = e.toCbor
-
-type Count[T] = object
-  val: T
-  count: int
-
-proc RLE[T](arr: openArray[T]): seq[Count[T]] =
-  # XXX: checkout https://github.com/powturbo/Turbo-Run-Length-Encoding
-  result = newSeq[Count[T]]()
-  var count = 1
-  for i in 0..<arr.high:
-    if arr[i] != arr[i+1]:
-      result.add Count[T](val: arr[i], count: count)
-      count = 0
-    count += 1
-  if arr.len > 0:
-    result.add Count[T](val: arr[^1], count: count)
-
-proc deltaEncode[T](arr: openArray[T]): seq[T] =
-  # XXX: SIMD (its second vector is just same with offset 1)
-  result = newSeq[T](arr.len)
-  if arr.len == 0:
-    return
-  result[0] = arr[0]
-  for i in 1..arr.high:
-    result[i] = arr[i]-arr[i-1]
 
 type
   Id = uint32
@@ -91,23 +44,6 @@ proc initBlock(): Block =
   result.val2Id = initTable[string, Id]()
   result.id2Val = newSeq[string]()
   # result.entries = newSeq[Entry]()
-
-type
-  FlatField = object
-    name: string
-    val: JsonNode
-  FlatEntry = seq[FlatField]
-
-proc flatEntry(arr: var FlatEntry, e: JsonNode, path: string) =
-  for k, v in e.fields.pairs:
-    if unlikely v.kind == JObject:
-      flatEntry(arr, v, path & k & ".")
-    else:
-      arr.add FlatField(name: k, val: v)
-
-proc flatEntry(e: JsonNode): FlatEntry =
-  result = newSeqOfCap[FlatField](e.len)
-  flatEntry(result, e, "")
 
 proc add(self: Block, entry: JsonNode) =
   assert entry.kind == JObject, "only JObject can be passed"
@@ -261,10 +197,6 @@ proc dump(self: Block, path: string) =
   echo "values: ", hs(valuesSize), " columns: ", hs(columnsSize)
     # " entries: ", hs(entriesSize)
   strm.close()
-
-proc rndStr: string =
-  for _ in .. 10:
-    add(result, char(rand(int('A') .. int('z'))))
 
 proc runBench() =
   var f = newSeq[uint8]()

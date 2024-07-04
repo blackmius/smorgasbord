@@ -1,6 +1,6 @@
-import std/sequtils
 import std/[times, monotimes]
 import std/math
+import std/random
 
 template bench*(name: string, count: int, b: untyped) =
   echo name, ':', " (x", count, ")"
@@ -26,3 +26,7 @@ proc hs*(bytes: int, dp=1): string =
     b /= thresh
     u += 1
   return $math.round(b, dp) & ' ' & units[u]
+
+proc rndStr*: string =
+  for _ in 0..10:
+    add(result, char(rand(int('A') .. int('z'))))

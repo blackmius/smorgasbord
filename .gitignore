@@ -1,0 +1,6 @@
+*.gz
+*.json
+*.log
+*.bin
+*.zip
+**/node_modules
