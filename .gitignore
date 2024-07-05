@@ -3,4 +3,5 @@
 *.log
 *.bin
 *.zip
+*.lockb
 **/node_modules
