@@ -1,5 +1,5 @@
-import { BTree } from "@wecandobetter/btree";
-import { pack } from 'msgpackr';
+// import { BTree } from "@wecandobetter/btree";
+import { unpack, pack } from 'msgpackr';
 
 // 1. flatEntry is slow
 // one possible solution is to extract it to own service
@@ -43,22 +43,41 @@ function hs(bytes, dp=1) {
     return bytes.toFixed(dp) + ' ' + units[u];
 }
 
-const COLUMN_ENTRY_SIZE = 8;
 class Column {
     constructor(chunk) {
         // BTree<[ValId, LogId]>
-        this.index = new BTree(24,
-            (a, b)=>{
-                a = typeof a === 'number' ? chunk.values[a] : a;
-                b = typeof b === 'number' ? chunk.values[b] : b;
-                return a.compare(b);
-            }, a=>a[0])
+        // this.index = new BTree(24,
+        //     (a, b) => {
+        //         a = chunk.values[a];
+        //         b = chunk.values[b];
+        //         return a > b ? 1 : a < b ? -1 : 0;
+        //     }, a => a[0])
+        this.index = [];
         this.direct = new Map();
+        this.onlyNumbers = true;
+        this.sorted = true;
     }
 
     add(logId, valId) {
-        this.index.insert([valId, logId]);
+        if (typeof valId == 'number')
+            this.onlyNumbers = false;
+        this.sorted = false;
+        this.index.push([valId, logId]);
         this.direct.set(logId, valId);
+    }
+
+    ensureSorted() {
+        if (this.sorted) return;
+        this.index.sort((a, b) => {
+            a = chunk.values[a[0]];
+            b = chunk.values[b[0]];
+            return a > b ? 1 : a < b ? -1 : 0;
+        });
+        this.sorted = true;
+    }
+
+    find() {
+        this.ensureSorted();
     }
 }
 
@@ -67,26 +86,16 @@ class Chunk {
         this.columns = {};
         this.values = [];
         this.val2id = new Map();
-        this.colId = 0;
         this.logId = 0;
         this.valId = 0;
-
-        this.size = 0;
-        this.valTableSize = 0;
     }
 
     getVal(val) {
-        // pack is slow
-        const buf = pack(val);
-        if (typeof val === 'number')
-            return buf;
+        const buf = typeof val === 'object' ? pack(val) : val;
         const key = buf.toString();
         if (!this.val2id.has(key)) {
-          let valId = this.valId++;
-          this.val2id.set(key, valId);
-          this.values.push(buf);
-          this.size += buf.length;
-          this.valTableSize += buf.length;
+            this.val2id.set(key, this.valId++);
+            this.values.push(val);
         }
         return this.val2id.get(key);
     }
@@ -97,7 +106,6 @@ class Chunk {
             const valId = this.getVal(val);
             let column = this.columns[this.getVal(key)] ??= new Column(this);
             column.add(logId, valId);
-            this.size += COLUMN_ENTRY_SIZE;
         }
     }
 }
@@ -110,3 +118,7 @@ const dur = Bun.nanoseconds()-start;
 console.log(1_000_000_000 / (dur / 1_000_000));
 console.log(hs(chunk.size))
 console.log(hs(chunk.valTableSize))
+// for (const colId in chunk.columns) {
+//     const column = chunk.columns[colId];
+//     console.log(chunk.values[colId], column.only_numbers);
+// }
